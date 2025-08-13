@@ -1,0 +1,43 @@
+import requests
+
+BASE_URL = "https://confluence.company.com"
+PAGE_ID = "123456"  # The page ID you want to update
+
+auth_headers = {
+    "Authorization": "Bearer YOUR_PERSONAL_ACCESS_TOKEN",  # Or Basic auth
+    "Content-Type": "application/json"
+}
+
+# Step 1: Get current page info (including version)
+get_url = f"{BASE_URL}/rest/api/content/{PAGE_ID}?expand=body.storage,version"
+page = requests.get(get_url, headers=auth_headers).json()
+
+current_version = page["version"]["number"]
+title = page["title"]
+
+# Step 2: Prepare updated content
+new_content = "<p>This is the updated page content.</p>"
+
+payload = {
+    "id": PAGE_ID,
+    "type": "page",
+    "title": title,  # Keep same title unless changing it
+    "space": {"key": page["space"]["key"]},
+    "body": {
+        "storage": {
+            "value": new_content,
+            "representation": "storage"
+        }
+    },
+    "version": {
+        "number": current_version + 1,
+        "minorEdit": False
+    }
+}
+
+# Step 3: Send update
+update_url = f"{BASE_URL}/rest/api/content/{PAGE_ID}"
+res = requests.put(update_url, headers=auth_headers, json=payload)
+res.raise_for_status()
+
+print("Page updated successfully:", res.json()["title"])
