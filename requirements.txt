@@ -1,43 +1,130 @@
+# test_confluence_client.py
+import json
+import pytest
+import responses
+from confluence_client import ConfluenceClient, ConfluenceError
+
+
+BASE = "https://confluence.example.com"
+
+
+@pytest.fixture
+def client():
+    return ConfluenceClient(base_url=BASE)
+
+
+@pytest.fixture(autouse=True)
+def _responses():
+    with responses.RequestsMock(assert_all_requests_are_fired=False) as rsps:
+        yield rsps
+
+
+def _last_json(rsps: responses.RequestsMock):
+    # Helper to read last request JSON body
+    body = rsps.calls[-1].request.body
+    if isinstance(body, (bytes, bytearray)):
+        body = body.decode()
+    return json.loads(body) if body else None
+
+
+def test_create_page_success(client, _responses):
+    _responses.add(
+        responses.POST,
+        f"{BASE}/rest/api/content",
+        json={"id": "12345", "type": "page", "title": "My Page"},
+        status=200,
+    )
+
+    result = client.create_page(space_key="ENG", title="My Page", html_body="<p>Hello</p>")
+
+    assert result["id"] == "12345"
+    # Verify request payload structure
+    sent = _last_json(_responses)
+    assert sent["type"] == "page"
+    assert sent["title"] == "My Page"
+    assert sent["space"]["key"] == "ENG"
+    assert sent["body"]["storage"]["representation"] == "storage"
+    assert sent["body"]["storage"]["value"] == "<p>Hello</p>"
+
+
+def test_create_page_validation_error(client, _responses):
+    _responses.add(
+        responses.POST,
+        f"{BASE}/rest/api/content",
+        json={"message": "A page with this title already exists."},
+        status=400,
+    )
+
+    with pytest.raises(ConfluenceError) as ei:
+        client.create_page(space_key="ENG", title="My Page", html_body="<p>Hello</p>")
+
+    assert "title already exists" in str(ei.value)
+
+
+def test_create_page_error_list_format(client, _responses):
+    # Some Confluence errors come as {"errors":[{"message":"..."}]}
+    _responses.add(
+        responses.POST,
+        f"{BASE}/rest/api/content",
+        json={"errors": [{"message": "Space does not exist"}]},
+        status=400,
+    )
+    with pytest.raises(ConfluenceError) as ei:
+        client.create_page(space_key="NOPE", title="X", html_body="x")
+    assert "Space does not exist" in str(ei.value)
+
+
+def test_update_page_success(client, _responses):
+    page_id = "12345"
+    _responses.add(
+        responses.PUT,
+        f"{BASE}/rest/api/content/{page_id}",
+        json={"id": page_id, "version": {"number": 3}},
+        status=200,
+    )
+
+    result = client.update_page(page_id=page_id, html_body="<p>Updated</p>", version=2)
+
+    assert result["version"]["number"] == 3
+    sent = _last_json(_responses)
+    assert sent["version"]["number"] == 3
+    assert sent["body"]["storage"]["value"] == "<p>Updated</p>"
+
+
+def test_update_page_409_conflict(client, _responses):
+    # Typical when your version is stale
+    page_id = "12345"
+    _responses.add(
+        responses.PUT,
+        f"{BASE}/rest/api/content/{page_id}",
+        json={"message": "Version conflict"},
+        status=409,
+    )
+
+    with pytest.raises(ConfluenceError) as ei:
+        client.update_page(page_id=page_id, html_body="hi", version=1)
+
+    assert "Version conflict" in str(ei.value)
 import requests
+import responses
 
-BASE_URL = "https://confluence.company.com"
-PAGE_ID = "123456"  # The page ID you want to update
+@responses.activate  # or use pytest fixture
+def test_example():
+    # 1. Register a fake endpoint
+    responses.add(
+        responses.GET,                               # HTTP method
+        "https://api.example.com/users/1",           # URL to match
+        json={"id": 1, "name": "Alice"},             # fake response body
+        status=200                                   # fake status code
+    )
 
-auth_headers = {
-    "Authorization": "Bearer YOUR_PERSONAL_ACCESS_TOKEN",  # Or Basic auth
-    "Content-Type": "application/json"
-}
+    # 2. Call your code (requests.get under the hood)
+    resp = requests.get("https://api.example.com/users/1")
 
-# Step 1: Get current page info (including version)
-get_url = f"{BASE_URL}/rest/api/content/{PAGE_ID}?expand=body.storage,version"
-page = requests.get(get_url, headers=auth_headers).json()
+    # 3. Verify it behaved as expected
+    assert resp.status_code == 200
+    assert resp.json()["name"] == "Alice"
 
-current_version = page["version"]["number"]
-title = page["title"]
-
-# Step 2: Prepare updated content
-new_content = "<p>This is the updated page content.</p>"
-
-payload = {
-    "id": PAGE_ID,
-    "type": "page",
-    "title": title,  # Keep same title unless changing it
-    "space": {"key": page["space"]["key"]},
-    "body": {
-        "storage": {
-            "value": new_content,
-            "representation": "storage"
-        }
-    },
-    "version": {
-        "number": current_version + 1,
-        "minorEdit": False
-    }
-}
-
-# Step 3: Send update
-update_url = f"{BASE_URL}/rest/api/content/{PAGE_ID}"
-res = requests.put(update_url, headers=auth_headers, json=payload)
-res.raise_for_status()
-
-print("Page updated successfully:", res.json()["title"])
+    # 4. Inspect what was sent
+    assert len(responses.calls) == 1
+    assert responses.calls[0].request.url == "https://api.example.com/users/1"
