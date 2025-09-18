@@ -1,3 +1,41 @@
+import requests
+from requests.auth import HTTPBasicAuth
+
+# === Configuration ===
+instance = "mycompany"                  # your instance name
+username = "myuser"                     # your ServiceNow username
+password = "mypassword"                 # your ServiceNow password or API token
+request_number = "REQ0012345"           # the request number you want
+
+# === API call ===
+url = f"https://{instance}.service-now.com/api/now/table/sc_request"
+params = {
+    "sysparm_query": f"number={request_number}",
+    "sysparm_fields": "sys_id,number,short_description,requested_for,opened_by,sys_created_on"
+}
+
+response = requests.get(
+    url,
+    auth=HTTPBasicAuth(username, password),
+    headers={"Accept": "application/json"},
+    params=params
+)
+
+# === Handle response ===
+if response.status_code == 200:
+    data = response.json().get("result", [])
+    if data:
+        req = data[0]
+        print("Request Number:", req["number"])
+        print("Short Description:", req["short_description"])
+        print("Requested For:", req["requested_for"])
+        print("Opened By:", req["opened_by"])
+        print("Created On:", req["sys_created_on"])
+    else:
+        print("No request found with that number.")
+else:
+    print("Error:", response.status_code, response.text)
+
 # test_confluence_client.py
 import json
 import pytest
@@ -128,3 +166,4 @@ def test_example():
     # 4. Inspect what was sent
     assert len(responses.calls) == 1
     assert responses.calls[0].request.url == "https://api.example.com/users/1"
+
