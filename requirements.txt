@@ -1,18 +1,26 @@
-from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
+<!-- Toast container (top-right) -->
+<div class="toast-container position-fixed top-0 end-0 p-3" style="z-index: 1100;">
+    <div id="statusToast" class="toast text-bg-primary" role="alert" aria-live="assertive" aria-atomic="true">
+        <div class="d-flex">
+            <div id="statusToastBody" class="toast-body">
+                Status message here
+            </div>
+            <button type="button" class="btn-close btn-close-white me-2 m-auto"
+                    data-bs-dismiss="toast" aria-label="Close"></button>
+        </div>
+    </div>
+</div>
 
-p = doc.add_paragraph()
-r = p.add_run()
-fldChar1 = OxmlElement("w:fldChar")
-fldChar1.set(qn("w:fldCharType"), "begin")
+function showStatus(message, type="primary") {
+    const toastEl = document.getElementById('statusToast');
+    const toastBody = document.getElementById('statusToastBody');
 
-instrText = OxmlElement("w:instrText")
-instrText.text = 'SEQ Table \\* ARABIC'
-fldChar2 = OxmlElement("w:fldChar")
-fldChar2.set(qn("w:fldCharType"), "end")
+    // update text & color
+    toastBody.textContent = message;
+    toastEl.className = `toast text-bg-${type}`;
 
-r._r.append(fldChar1)
-r._r.append(instrText)
-r._r.append(fldChar2)
-
-p.add_run(" Table caption text")
+    const toast = bootstrap.Toast.getOrCreateInstance(toastEl, {
+        delay: 1000    // 1 second
+    });
+    toast.show();
+}
