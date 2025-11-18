@@ -1,26 +1,41 @@
-<!-- Toast container (top-right) -->
-<div class="toast-container position-fixed top-0 end-0 p-3" style="z-index: 1100;">
-    <div id="statusToast" class="toast text-bg-primary" role="alert" aria-live="assertive" aria-atomic="true">
-        <div class="d-flex">
-            <div id="statusToastBody" class="toast-body">
-                Status message here
-            </div>
-            <button type="button" class="btn-close btn-close-white me-2 m-auto"
-                    data-bs-dismiss="toast" aria-label="Close"></button>
-        </div>
-    </div>
-</div>
+from zipfile import ZipFile, ZIP_DEFLATED
+from lxml import etree
 
-function showStatus(message, type="primary") {
-    const toastEl = document.getElementById('statusToast');
-    const toastBody = document.getElementById('statusToastBody');
+INPUT_DOTM = "template.dotm"
+OUTPUT_DOTM = "template_modified.dotm"
 
-    // update text & color
-    toastBody.textContent = message;
-    toastEl.className = `toast text-bg-${type}`;
+# Namespace for WordprocessingML
+NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 
-    const toast = bootstrap.Toast.getOrCreateInstance(toastEl, {
-        delay: 1000    // 1 second
-    });
-    toast.show();
-}
+# 1. Read document.xml from the .dotm
+with ZipFile(INPUT_DOTM, "r") as zin:
+    # Get the raw XML bytes of word/document.xml
+    document_xml_bytes = zin.read("word/document.xml")
+
+    # Parse XML
+    root = etree.fromstring(document_xml_bytes)
+    
+    # === Example modification ===
+    # Change the text of the first run in the first paragraph
+    # Adjust the XPath as needed for your real scenario
+    first_text_nodes = root.xpath("//w:p[1]//w:t[1]", namespaces=NS)
+    if first_text_nodes:
+        first_text_nodes[0].text = "Hello from Python inside DOTM!"
+    
+    # Serialize modified XML back to bytes
+    new_document_xml_bytes = etree.tostring(
+        root,
+        xml_declaration=True,
+        encoding="UTF-8",
+        standalone="yes"
+    )
+
+    # 2. Write a new .dotm with modified document.xml
+    with ZipFile(OUTPUT_DOTM, "w", ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            if item.filename == "word/document.xml":
+                # Write our modified document.xml
+                zout.writestr(item, new_document_xml_bytes)
+            else:
+                # Copy everything else unchanged
+                zout.writestr(item, zin.read(item.filename))
