@@ -1,41 +1,66 @@
+from io import BytesIO
 from zipfile import ZipFile, ZIP_DEFLATED
 from lxml import etree
+from docx import Document  # python-docx
 
-INPUT_DOTM = "template.dotm"
-OUTPUT_DOTM = "template_modified.dotm"
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+NS = {"w": W_NS}
 
-# Namespace for WordprocessingML
-NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 
-# 1. Read document.xml from the .dotm
-with ZipFile(INPUT_DOTM, "r") as zin:
-    # Get the raw XML bytes of word/document.xml
-    document_xml_bytes = zin.read("word/document.xml")
+def modify_document_xml(xml_bytes: bytes) -> bytes:
+    """
+    Receives word/document.xml as bytes, returns modified bytes.
+    Example modification: append " !!!" to every <w:t>.
+    """
+    root = etree.fromstring(xml_bytes)  # bytes => OK even with XML declaration
 
-    # Parse XML
-    root = etree.fromstring(document_xml_bytes)
-    
-    # === Example modification ===
-    # Change the text of the first run in the first paragraph
-    # Adjust the XPath as needed for your real scenario
-    first_text_nodes = root.xpath("//w:p[1]//w:t[1]", namespaces=NS)
-    if first_text_nodes:
-        first_text_nodes[0].text = "Hello from Python inside DOTM!"
-    
-    # Serialize modified XML back to bytes
-    new_document_xml_bytes = etree.tostring(
-        root,
-        xml_declaration=True,
-        encoding="UTF-8",
-        standalone="yes"
-    )
+    for t in root.xpath("//w:t", namespaces=NS):
+        if t.text:
+            t.text = t.text + " !!!"
 
-    # 2. Write a new .dotm with modified document.xml
-    with ZipFile(OUTPUT_DOTM, "w", ZIP_DEFLATED) as zout:
+    # Keep standalone / declaration like Word expects
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone="yes")
+
+
+def doc_to_modified_docx_bytes(doc: Document) -> bytes:
+    # 1) Save Document to BytesIO
+    src_buf = BytesIO()
+    doc.save(src_buf)
+    src_buf.seek(0)
+
+    # 2) Read as zip, modify document.xml, rebuild zip in memory
+    out_buf = BytesIO()
+
+    with ZipFile(src_buf, "r") as zin, ZipFile(out_buf, "w", compression=ZIP_DEFLATED) as zout:
+        # Read original document.xml
+        original_xml = zin.read("word/document.xml")
+        new_xml = modify_document_xml(original_xml)
+
         for item in zin.infolist():
+            data = zin.read(item.filename)
+
+            # Replace only document.xml
             if item.filename == "word/document.xml":
-                # Write our modified document.xml
-                zout.writestr(item, new_document_xml_bytes)
-            else:
-                # Copy everything else unchanged
-                zout.writestr(item, zin.read(item.filename))
+                data = new_xml
+
+            # Write everything back (keeps all relationships/parts intact)
+            zout.writestr(item, data)
+
+    return out_buf.getvalue()
+
+
+def rebuild_document_from_bytes(docx_bytes: bytes) -> Document:
+    buf = BytesIO(docx_bytes)
+    return Document(buf)
+
+
+# -------------------
+# Demo usage
+# -------------------
+doc = Document()
+doc.add_paragraph("Hello world")
+
+modified_bytes = doc_to_modified_docx_bytes(doc)
+new_doc = rebuild_document_from_bytes(modified_bytes)
+
+print(new_doc.paragraphs[0].text)  # "Hello world !!!"
