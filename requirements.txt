@@ -1,66 +1,93 @@
-from io import BytesIO
-from zipfile import ZipFile, ZIP_DEFLATED
-from lxml import etree
-from docx import Document  # python-docx
+from langchain_postgres import PGVector
+from langchain_openai import OpenAIEmbeddings
 
-W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-NS = {"w": W_NS}
+CONN_STR = "postgresql+psycopg://user:pass@host:5432/dbname"
 
+embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
 
-def modify_document_xml(xml_bytes: bytes) -> bytes:
+vectorstore = PGVector(
+    connection=CONN_STR,
+    embeddings=embeddings,
+    collection_name="my_collection",
+    use_jsonb=True,  # common/default in newer setups
+)
+
+from langchain_core.documents import Document
+
+def retrieve_relevant_docs(
+    query: str,
+    k: int = 6,
+    min_score: float = 0.55,
+    filter: dict | None = None,
+) -> list[Document]:
     """
-    Receives word/document.xml as bytes, returns modified bytes.
-    Example modification: append " !!!" to every <w:t>.
+    Returns docs only if they meet min_score, otherwise [].
     """
-    root = etree.fromstring(xml_bytes)  # bytes => OK even with XML declaration
+    results = vectorstore.similarity_search_with_relevance_scores(
+        query,
+        k=k,
+        filter=filter,      # optional metadata filter
+    )
+    # results: list[(Document, score)] where score is usually normalized to [0..1]
+    good = [doc for doc, score in results if score >= min_score]
+    return good
 
-    for t in root.xpath("//w:t", namespaces=NS):
-        if t.text:
-            t.text = t.text + " !!!"
+def retrieve_with_gap_gate(
+    query: str,
+    k: int = 6,
+    min_score: float = 0.55,
+    min_gap: float = 0.08,
+    filter: dict | None = None,
+) -> list[Document]:
+    results = vectorstore.similarity_search_with_relevance_scores(
+        query, k=k, filter=filter
+    )
+    if not results:
+        return []
 
-    # Keep standalone / declaration like Word expects
-    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone="yes")
+    # Sort high→low by score
+    results = sorted(results, key=lambda x: x[1], reverse=True)
+    top_doc, top_score = results[0]
 
+    # If top is low, reject
+    if top_score < min_score:
+        return []
 
-def doc_to_modified_docx_bytes(doc: Document) -> bytes:
-    # 1) Save Document to BytesIO
-    src_buf = BytesIO()
-    doc.save(src_buf)
-    src_buf.seek(0)
+    # If top is not meaningfully better than runner-up, reject (optional)
+    if len(results) > 1 and (top_score - results[1][1]) < min_gap:
+        return []
 
-    # 2) Read as zip, modify document.xml, rebuild zip in memory
-    out_buf = BytesIO()
+    return [doc for doc, score in results if score >= min_score]
 
-    with ZipFile(src_buf, "r") as zin, ZipFile(out_buf, "w", compression=ZIP_DEFLATED) as zout:
-        # Read original document.xml
-        original_xml = zin.read("word/document.xml")
-        new_xml = modify_document_xml(original_xml)
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
 
-        for item in zin.infolist():
-            data = zin.read(item.filename)
+llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0)
 
-            # Replace only document.xml
-            if item.filename == "word/document.xml":
-                data = new_xml
+prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a QA assistant. Answer ONLY using the provided context. "
+     "If the context does not contain the answer, say you don't know."),
+    ("human", "Question: {question}\n\nContext:\n{context}")
+])
 
-            # Write everything back (keeps all relationships/parts intact)
-            zout.writestr(item, data)
+def answer_question(question: str, user_id: str | None = None) -> str:
+    # Optional: ensure you only search the user’s uploaded docs
+    metadata_filter = {"user_id": user_id} if user_id else None
 
-    return out_buf.getvalue()
+    docs = retrieve_with_gap_gate(
+        question,
+        k=6,
+        min_score=0.58,
+        min_gap=0.08,
+        filter=metadata_filter,
+    )
 
+    if not docs:
+        return "I can’t find anything related to that in the uploaded documents."
 
-def rebuild_document_from_bytes(docx_bytes: bytes) -> Document:
-    buf = BytesIO(docx_bytes)
-    return Document(buf)
+    context = "\n\n".join(d.page_content for d in docs)
+    return llm.invoke(
+        prompt.format_messages(question=question, context=context)
+    ).content
 
-
-# -------------------
-# Demo usage
-# -------------------
-doc = Document()
-doc.add_paragraph("Hello world")
-
-modified_bytes = doc_to_modified_docx_bytes(doc)
-new_doc = rebuild_document_from_bytes(modified_bytes)
-
-print(new_doc.paragraphs[0].text)  # "Hello world !!!"
