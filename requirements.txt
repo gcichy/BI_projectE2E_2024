@@ -1,93 +1,150 @@
-from langchain_postgres import PGVector
-from langchain_openai import OpenAIEmbeddings
+#!/usr/bin/env python3
+"""
+Chat with memory + token-based trimming.
+- Keeps System message forever
+- Pins the first assistant response forever
+- When history exceeds threshold, removes oldest messages excluding pinned ones.
+"""
 
-CONN_STR = "postgresql+psycopg://user:pass@host:5432/dbname"
+from __future__ import annotations
 
-embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+from dataclasses import dataclass
+from typing import List, Dict, Optional, Set
 
-vectorstore = PGVector(
-    connection=CONN_STR,
-    embeddings=embeddings,
-    collection_name="my_collection",
-    use_jsonb=True,  # common/default in newer setups
-)
-
-from langchain_core.documents import Document
-
-def retrieve_relevant_docs(
-    query: str,
-    k: int = 6,
-    min_score: float = 0.55,
-    filter: dict | None = None,
-) -> list[Document]:
-    """
-    Returns docs only if they meet min_score, otherwise [].
-    """
-    results = vectorstore.similarity_search_with_relevance_scores(
-        query,
-        k=k,
-        filter=filter,      # optional metadata filter
-    )
-    # results: list[(Document, score)] where score is usually normalized to [0..1]
-    good = [doc for doc, score in results if score >= min_score]
-    return good
-
-def retrieve_with_gap_gate(
-    query: str,
-    k: int = 6,
-    min_score: float = 0.55,
-    min_gap: float = 0.08,
-    filter: dict | None = None,
-) -> list[Document]:
-    results = vectorstore.similarity_search_with_relevance_scores(
-        query, k=k, filter=filter
-    )
-    if not results:
-        return []
-
-    # Sort high→low by score
-    results = sorted(results, key=lambda x: x[1], reverse=True)
-    top_doc, top_score = results[0]
-
-    # If top is low, reject
-    if top_score < min_score:
-        return []
-
-    # If top is not meaningfully better than runner-up, reject (optional)
-    if len(results) > 1 and (top_score - results[1][1]) < min_gap:
-        return []
-
-    return [doc for doc, score in results if score >= min_score]
+try:
+    import tiktoken
+except ImportError as e:
+    raise SystemExit(
+        "Missing dependency: tiktoken\n"
+        "Install with: pip install tiktoken\n"
+        "(or add it to your pyproject.toml dev deps)"
+    ) from e
 
 from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
 
-llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0)
 
-prompt = ChatPromptTemplate.from_messages([
-    ("system",
-     "You are a QA assistant. Answer ONLY using the provided context. "
-     "If the context does not contain the answer, say you don't know."),
-    ("human", "Question: {question}\n\nContext:\n{context}")
-])
+Message = Dict[str, str]  # {"role": "system"|"user"|"assistant", "content": "..."}
 
-def answer_question(question: str, user_id: str | None = None) -> str:
-    # Optional: ensure you only search the user’s uploaded docs
-    metadata_filter = {"user_id": user_id} if user_id else None
 
-    docs = retrieve_with_gap_gate(
-        question,
-        k=6,
-        min_score=0.58,
-        min_gap=0.08,
-        filter=metadata_filter,
+def count_tokens_chat(messages: List[Message], model: str) -> int:
+    """
+    Reasonable token estimate for chat messages.
+    Overhead differs by model; this is a conservative approximation suitable for trimming.
+    """
+    enc = tiktoken.encoding_for_model(model)
+
+    tokens = 0
+    for m in messages:
+        # Approx per-message overhead for chat formatting
+        tokens += 4
+        tokens += len(enc.encode(m["content"]))
+    # Assistant reply priming
+    tokens += 2
+    return tokens
+
+
+@dataclass
+class MemoryManager:
+    model_name: str
+    max_context_tokens: int = 8000
+    reserve_for_answer: int = 1000
+
+    # Message indexes we never remove (system + first assistant response)
+    pinned_indices: Set[int] = None
+
+    def __post_init__(self):
+        self.pinned_indices = set()
+
+    @property
+    def budget(self) -> int:
+        """Max tokens allowed for the prompt/history (leaving room for the answer)."""
+        return max(0, self.max_context_tokens - self.reserve_for_answer)
+
+    def trim_in_place(self, history: List[Message]) -> None:
+        """
+        Trim the history until it fits in the budget.
+        Removes the oldest non-pinned message (skips system + first assistant response).
+        """
+        while count_tokens_chat(history, self.model_name) > self.budget:
+            # Find oldest removable message: lowest index not pinned
+            removable_idx = None
+            for i in range(len(history)):
+                if i in self.pinned_indices:
+                    continue
+                # extra safety: never remove system message
+                if history[i]["role"] == "system":
+                    continue
+                removable_idx = i
+                break
+
+            # If nothing is removable, we can't trim further safely
+            if removable_idx is None:
+                break
+
+            history.pop(removable_idx)
+
+            # After popping, pinned indices above removable_idx shift down by 1
+            self.pinned_indices = {pi - 1 if pi > removable_idx else pi for pi in self.pinned_indices}
+
+
+def main():
+    MODEL = "gpt-4.1-mini"  # change as needed
+    llm = ChatOpenAI(model=MODEL, temperature=0)
+
+    memory = MemoryManager(
+        model_name=MODEL,
+        max_context_tokens=8000,   # choose based on your model context window
+        reserve_for_answer=1200,   # headroom so the model can respond
     )
 
-    if not docs:
-        return "I can’t find anything related to that in the uploaded documents."
+    history: List[Message] = [
+        {
+            "role": "system",
+            "content": (
+                "You are a helpful assistant. Use the chat history to answer follow-up questions. "
+                "If a user references 'that/it/they', resolve it from the conversation."
+            ),
+        }
+    ]
 
-    context = "\n\n".join(d.page_content for d in docs)
-    return llm.invoke(
-        prompt.format_messages(question=question, context=context)
-    ).content
+    # Pin the system message at index 0
+    memory.pinned_indices.add(0)
 
+    first_assistant_pinned = False
+
+    print("Type 'exit' to quit.\n")
+
+    while True:
+        user_text = input("You: ").strip()
+        if user_text.lower() in {"exit", "quit"}:
+            break
+
+        # Add user turn
+        history.append({"role": "user", "content": user_text})
+
+        # Trim before calling model (optional but recommended)
+        memory.trim_in_place(history)
+
+        # Call LLM
+        response = llm.invoke(history)
+        assistant_text = response.content
+
+        # Add assistant turn
+        history.append({"role": "assistant", "content": assistant_text})
+
+        # Pin the first assistant response (the first time we add one)
+        if not first_assistant_pinned:
+            memory.pinned_indices.add(len(history) - 1)
+            first_assistant_pinned = True
+
+        # Trim after adding assistant (recommended)
+        memory.trim_in_place(history)
+
+        used = count_tokens_chat(history, MODEL)
+        print(f"\nAssistant: {assistant_text}\n")
+        print(f"[debug] history tokens ~ {used} / budget {memory.budget} "
+              f"(max {memory.max_context_tokens}, reserve {memory.reserve_for_answer})\n")
+
+
+if __name__ == "__main__":
+    main()
