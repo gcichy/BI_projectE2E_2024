@@ -148,3 +148,63 @@ def main():
 
 if __name__ == "__main__":
     main()
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.documents import Document
+
+llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0)
+
+# Step 1: condense follow-up question -> standalone question for retrieval
+condense_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "Rewrite the user's question into a standalone question. "
+     "Use chat history to resolve references (it/that/they). "
+     "Return ONLY the standalone question."),
+    MessagesPlaceholder(variable_name="history"),
+    ("human", "{question}"),
+])
+
+# Step 2: answer using retrieved context + history
+answer_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a helpful assistant. Use the provided context to answer. "
+     "If the context does not contain the answer, say you don't know. "
+     "Be concise."),
+    MessagesPlaceholder(variable_name="history"),
+    ("human",
+     "Question: {question}\n\n"
+     "Retrieved context:\n{context}\n\n"
+     "Answer:"),
+])
+
+history: list = []
+
+def format_docs(docs: list[Document]) -> str:
+    return "\n\n".join(f"[{i+1}] {d.page_content}" for i, d in enumerate(docs))
+
+def ask(question: str) -> str:
+    # (A) create a standalone retrieval query
+    standalone_q_msg = condense_prompt.invoke({
+        "history": history,
+        "question": question,
+    })
+    standalone_q = llm.invoke(standalone_q_msg).content.strip()
+
+    # (B) retrieve with standalone question
+    docs = vectorstore.similarity_search(standalone_q, k=5)
+    context = format_docs(docs)
+
+    # (C) answer (keep original user question + history)
+    answer_msgs = answer_prompt.invoke({
+        "history": history,
+        "question": question,
+        "context": context,
+    })
+    response = llm.invoke(answer_msgs)
+
+    # (D) save turns
+    history.append(HumanMessage(content=question))
+    history.append(AIMessage(content=response.content))
+
+    return response.content
