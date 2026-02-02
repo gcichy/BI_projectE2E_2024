@@ -1,210 +1,32 @@
-#!/usr/bin/env python3
-"""
-Chat with memory + token-based trimming.
-- Keeps System message forever
-- Pins the first assistant response forever
-- When history exceeds threshold, removes oldest messages excluding pinned ones.
-"""
+from lxml import etree
 
-from __future__ import annotations
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+XML_NS = "http://www.w3.org/XML/1998/namespace"
 
-from dataclasses import dataclass
-from typing import List, Dict, Optional, Set
+def qn(local: str) -> str:
+    return f"{{{W_NS}}}{local}"
 
-try:
-    import tiktoken
-except ImportError as e:
-    raise SystemExit(
-        "Missing dependency: tiktoken\n"
-        "Install with: pip install tiktoken\n"
-        "(or add it to your pyproject.toml dev deps)"
-    ) from e
-
-from langchain_openai import ChatOpenAI
-
-
-Message = Dict[str, str]  # {"role": "system"|"user"|"assistant", "content": "..."}
-
-
-def count_tokens_chat(messages: List[Message], model: str) -> int:
+def set_run_text_with_newlines(r: etree._Element, text: str) -> None:
     """
-    Reasonable token estimate for chat messages.
-    Overhead differs by model; this is a conservative approximation suitable for trimming.
+    Replace the contents of a <w:r> with text where '\n' becomes <w:br/>.
+    Keeps existing run properties (<w:rPr>) if present.
     """
-    enc = tiktoken.encoding_for_model(model)
+    # keep run properties if present
+    rpr = r.find(qn("rPr"))
 
-    tokens = 0
-    for m in messages:
-        # Approx per-message overhead for chat formatting
-        tokens += 4
-        tokens += len(enc.encode(m["content"]))
-    # Assistant reply priming
-    tokens += 2
-    return tokens
+    # remove everything except rPr
+    for child in list(r):
+        if child is not rpr:
+            r.remove(child)
 
+    parts = text.split("\n")
 
-@dataclass
-class MemoryManager:
-    model_name: str
-    max_context_tokens: int = 8000
-    reserve_for_answer: int = 1000
+    for i, part in enumerate(parts):
+        if i > 0:
+            etree.SubElement(r, qn("br"))
 
-    # Message indexes we never remove (system + first assistant response)
-    pinned_indices: Set[int] = None
-
-    def __post_init__(self):
-        self.pinned_indices = set()
-
-    @property
-    def budget(self) -> int:
-        """Max tokens allowed for the prompt/history (leaving room for the answer)."""
-        return max(0, self.max_context_tokens - self.reserve_for_answer)
-
-    def trim_in_place(self, history: List[Message]) -> None:
-        """
-        Trim the history until it fits in the budget.
-        Removes the oldest non-pinned message (skips system + first assistant response).
-        """
-        while count_tokens_chat(history, self.model_name) > self.budget:
-            # Find oldest removable message: lowest index not pinned
-            removable_idx = None
-            for i in range(len(history)):
-                if i in self.pinned_indices:
-                    continue
-                # extra safety: never remove system message
-                if history[i]["role"] == "system":
-                    continue
-                removable_idx = i
-                break
-
-            # If nothing is removable, we can't trim further safely
-            if removable_idx is None:
-                break
-
-            history.pop(removable_idx)
-
-            # After popping, pinned indices above removable_idx shift down by 1
-            self.pinned_indices = {pi - 1 if pi > removable_idx else pi for pi in self.pinned_indices}
-
-
-def main():
-    MODEL = "gpt-4.1-mini"  # change as needed
-    llm = ChatOpenAI(model=MODEL, temperature=0)
-
-    memory = MemoryManager(
-        model_name=MODEL,
-        max_context_tokens=8000,   # choose based on your model context window
-        reserve_for_answer=1200,   # headroom so the model can respond
-    )
-
-    history: List[Message] = [
-        {
-            "role": "system",
-            "content": (
-                "You are a helpful assistant. Use the chat history to answer follow-up questions. "
-                "If a user references 'that/it/they', resolve it from the conversation."
-            ),
-        }
-    ]
-
-    # Pin the system message at index 0
-    memory.pinned_indices.add(0)
-
-    first_assistant_pinned = False
-
-    print("Type 'exit' to quit.\n")
-
-    while True:
-        user_text = input("You: ").strip()
-        if user_text.lower() in {"exit", "quit"}:
-            break
-
-        # Add user turn
-        history.append({"role": "user", "content": user_text})
-
-        # Trim before calling model (optional but recommended)
-        memory.trim_in_place(history)
-
-        # Call LLM
-        response = llm.invoke(history)
-        assistant_text = response.content
-
-        # Add assistant turn
-        history.append({"role": "assistant", "content": assistant_text})
-
-        # Pin the first assistant response (the first time we add one)
-        if not first_assistant_pinned:
-            memory.pinned_indices.add(len(history) - 1)
-            first_assistant_pinned = True
-
-        # Trim after adding assistant (recommended)
-        memory.trim_in_place(history)
-
-        used = count_tokens_chat(history, MODEL)
-        print(f"\nAssistant: {assistant_text}\n")
-        print(f"[debug] history tokens ~ {used} / budget {memory.budget} "
-              f"(max {memory.max_context_tokens}, reserve {memory.reserve_for_answer})\n")
-
-
-if __name__ == "__main__":
-    main()
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langchain_core.documents import Document
-
-llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0)
-
-# Step 1: condense follow-up question -> standalone question for retrieval
-condense_prompt = ChatPromptTemplate.from_messages([
-    ("system",
-     "Rewrite the user's question into a standalone question. "
-     "Use chat history to resolve references (it/that/they). "
-     "Return ONLY the standalone question."),
-    MessagesPlaceholder(variable_name="history"),
-    ("human", "{question}"),
-])
-
-# Step 2: answer using retrieved context + history
-answer_prompt = ChatPromptTemplate.from_messages([
-    ("system",
-     "You are a helpful assistant. Use the provided context to answer. "
-     "If the context does not contain the answer, say you don't know. "
-     "Be concise."),
-    MessagesPlaceholder(variable_name="history"),
-    ("human",
-     "Question: {question}\n\n"
-     "Retrieved context:\n{context}\n\n"
-     "Answer:"),
-])
-
-history: list = []
-
-def format_docs(docs: list[Document]) -> str:
-    return "\n\n".join(f"[{i+1}] {d.page_content}" for i, d in enumerate(docs))
-
-def ask(question: str) -> str:
-    # (A) create a standalone retrieval query
-    standalone_q_msg = condense_prompt.invoke({
-        "history": history,
-        "question": question,
-    })
-    standalone_q = llm.invoke(standalone_q_msg).content.strip()
-
-    # (B) retrieve with standalone question
-    docs = vectorstore.similarity_search(standalone_q, k=5)
-    context = format_docs(docs)
-
-    # (C) answer (keep original user question + history)
-    answer_msgs = answer_prompt.invoke({
-        "history": history,
-        "question": question,
-        "context": context,
-    })
-    response = llm.invoke(answer_msgs)
-
-    # (D) save turns
-    history.append(HumanMessage(content=question))
-    history.append(AIMessage(content=response.content))
-
-    return response.content
+        t = etree.SubElement(r, qn("t"))
+        # Preserve leading/trailing spaces (Word collapses otherwise)
+        if part.startswith(" ") or part.endswith(" "):
+            t.set(f"{{{XML_NS}}}space", "preserve")
+        t.text = part
