@@ -1,45 +1,39 @@
-import xlwings as xw
-import tempfile
-from pathlib import Path
+#!/bin/bash
 
-@xw.sub
-def import_xlsx_bytes():
-    wb = xw.Book.caller()
-    dest_name = "ImportedData"
+set -e
 
-    # --- your bytes come from somewhere ---
-    # xlsx_bytes = ...
-    xlsx_bytes = get_xlsx_bytes_somehow()
+OVERWRITE=false
 
-    # 1) save to a temporary file
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as f:
-            f.write(xlsx_bytes)
-            tmp_path = f.name
+# Parse arguments
+for arg in "$@"; do
+    case $arg in
+        --overwrite)
+            OVERWRITE=true
+            shift
+            ;;
+        *)
+            echo "Unknown option: $arg"
+            exit 1
+            ;;
+    esac
+done
 
-        # 2) open temp xlsx with Excel/xlwings
-        src_wb = xw.Book(tmp_path)
-        try:
-            src_sht = src_wb.sheets[0]
-            data = src_sht.used_range.value  # 2D list
+# Get directory of this script
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TARGET_DIR="$HOME/temp"
 
-            # 3) create/clear destination sheet in the calling xlsm
-            if dest_name in [s.name for s in wb.sheets]:
-                dest_sht = wb.sheets[dest_name]
-                dest_sht.clear_contents()
-            else:
-                dest_sht = wb.sheets.add(dest_name, after=wb.sheets[-1])
+# Create target directory if it doesn't exist
+mkdir -p "$TARGET_DIR"
 
-            dest_sht.range("A1").value = data
-            dest_sht.autofit()
-        finally:
-            src_wb.close()
+# Enable safe empty glob handling
+shopt -s nullglob
 
-    finally:
-        # cleanup temp file
-        if tmp_path:
-            try:
-                Path(tmp_path).unlink(missing_ok=True)
-            except Exception:
-                pass
+if [ "$OVERWRITE" = true ]; then
+    echo "Overwriting existing files..."
+    cp -f "$SCRIPT_DIR"/* "$TARGET_DIR"/
+else
+    echo "Not overwriting existing files..."
+    cp -n "$SCRIPT_DIR"/* "$TARGET_DIR"/
+fi
+
+echo "Done."
